@@ -25,8 +25,8 @@ A [Model Context Protocol (MCP)](https://www.anthropic.com/news/model-context-pr
 1. Clone the repository:
 
 ```bash
-git clone https://github.com/RafalWilinski/mcp-apple-notes
-cd mcp-apple-notes
+git clone https://github.com/mcmaster-aaron/mcp-apple-notes-fixed.git
+cd mcp-apple-notes-fixed
 ```
 
 2. Install dependencies:
