@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.mcp-apple-notes.index</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <!-- Update this path if your bun binary is elsewhere -->
+        <string>/Users/armcmaster/.bun/bin/bun</string>
+        <string>run</string>
+        <string>/Users/armcmaster/Documents/src/mcp-apple-notes-fixed/index-cli.ts</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/armcmaster/Documents/src/mcp-apple-notes-fixed</string>
+
+    <!-- Run daily at 3:00 AM -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>3</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <!-- Redirect stdout/stderr to log files for debugging -->
+    <key>StandardOutPath</key>
+    <string>/Users/armcmaster/.mcp-apple-notes/index-cli-stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/armcmaster/.mcp-apple-notes/index-cli-stderr.log</string>
+
+    <!-- Don't retry if it fails — just wait for the next scheduled run -->
+    <key>StartInterval</key>
+    <false/>
+</dict>
+</plist>

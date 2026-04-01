@@ -119,7 +119,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "search-notes",
-        description: "Search for notes by title or content",
+        description: "Search for notes by title or content. Returns ranked titles with relevance scores. Use get-note to fetch full content of specific results.",
         inputSchema: {
           type: "object",
           properties: {
@@ -513,7 +513,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request, c) => {
         const { title } = GetNoteSchema.parse(args);
         const note = await getNoteDetailsByTitle(title);
 
-        return createTextResponse(`${note}`);
+        return createTextResponse(JSON.stringify(note));
       } catch (error) {
         return createTextResponse(error.message);
       }
@@ -565,12 +565,14 @@ const createTextResponse = (text: string) => ({
 
 /**
  * Search for notes by title or content using both vector and FTS search.
- * The results are combined using RRF
+ * The results are combined using RRF.
+ * Returns only titles and relevance scores to stay under the 1MB MCP response
+ * limit. Use the "get-note" tool to fetch full content for specific results.
  */
 export const searchAndCombineResults = async (
   notesTable: lancedb.Table,
   query: string,
-  limit = 20
+  limit = 10
 ) => {
   const [vectorResults, ftsSearchResults] = await Promise.all([
     (async () => {
@@ -590,26 +592,31 @@ export const searchAndCombineResults = async (
   ]);
 
   const k = 60;
-  const scores = new Map<string, number>();
+  const scores = new Map<string, { score: number; title: string }>();
 
   const processResults = (results: any[], startRank: number) => {
     results.forEach((result, idx) => {
-      const key = `${result.title}::${result.content}`;
+      const title = result.title;
       const score = 1 / (k + startRank + idx);
-      scores.set(key, (scores.get(key) || 0) + score);
+      const existing = scores.get(title);
+      if (existing) {
+        existing.score += score;
+      } else {
+        scores.set(title, { score, title });
+      }
     });
   };
 
   processResults(vectorResults, 0);
   processResults(ftsSearchResults, 0);
 
-  const results = Array.from(scores.entries())
-    .sort(([, a], [, b]) => b - a)
+  const results = Array.from(scores.values())
+    .sort((a, b) => b.score - a.score)
     .slice(0, limit)
-    .map(([key]) => {
-      const [title, content] = key.split("::");
-      return { title, content };
-    });
+    .map(({ title, score }) => ({
+      title,
+      relevance: Math.round(score * 10000) / 10000,
+    }));
 
   return results;
 };

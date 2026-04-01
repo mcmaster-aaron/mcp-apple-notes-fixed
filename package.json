@@ -28,5 +28,9 @@
   },
   "devDependencies": {
     "@types/turndown": "^5.0.5"
-  }
+  },
+  "trustedDependencies": [
+    "onnxruntime-node",
+    "protobufjs"
+  ]
 }

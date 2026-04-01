@@ -48,7 +48,7 @@ bun install
   "mcpServers": {
     "local-machine": {
       "command": "/Users/<YOUR_USER_NAME>/.bun/bin/bun",
-      "args": ["/Users/<YOUR_USER_NAME>/apple-notes-mcp/index.ts"]
+      "args": ["/Users/<YOUR_USER_NAME>/apple-notes-mcp-fixed/index.ts"]
     }
   }
 }
@@ -72,10 +72,23 @@ tail -n 50 -f ~/Library/Logs/Claude/mcp-server-local-machine.log
 tail -n 50 -f ~/Library/Logs/Claude/mcp.log
 ```
 
-## Todos
+## To schedule index rebuild 
 
-- [ ] Apple notes are returned in the HTML format. We should turn them to Markdown and embed that
-- [ ] Chunk source content using recursive text splitter or markdown text splitter
-- [ ] Add an option to use custom embeddings model
-- [ ] More control over DB - purge, custom queries, etc.
-- [x] Storing notes in Notes via Claude
+1. Install the plist:
+```bash
+cp com.mcp-apple-notes.index.plist ~/Library/LaunchAgents/
+```
+2. Load it:
+```bash
+launchctl load ~/Library/LaunchAgents/com.mcp-apple-notes.index.plist
+```
+3. Verify it's loaded:
+```bash
+launchctl list | grep mcp-apple-notes
+```
+
+To unload the scheduled rebuild
+
+```bash
+launchctl unload ~/Library/LaunchAgents/com.mcp-apple-notes.index.plist
+```
