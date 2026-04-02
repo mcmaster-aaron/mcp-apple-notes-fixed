@@ -1,17 +1,19 @@
 {
   "name": "apple-notes-mcp",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "author": "",
   "type": "module",
   "main": "index.ts",
-  "description": "",
+  "description": "MCP server for semantic search and RAG over Apple Notes using EmbeddingGemma",
   "keywords": [],
   "license": "ISC",
   "scripts": {
     "build": "bun build index.ts --outdir dist --target node",
     "start": "bun index.ts",
     "purge-db": "rm -rf ~/.mcp-apple-notes",
-    "test": "npx tsx index.test.ts"
+    "index": "bun index-cli.ts",
+    "index:incremental": "bun index-cli.ts --incremental",
+    "test": "bun test"
   },
   "exports": {
     ".": "./index.ts"
@@ -22,7 +24,6 @@
     "@lancedb/lancedb": "^0.14.0",
     "@langchain/textsplitters": "^0.1.0",
     "@modelcontextprotocol/sdk": "^1.0.3",
-    "run-jxa": "^3.0.0",
     "turndown": "^7.2.0",
     "zod": "^3.24.1"
   },

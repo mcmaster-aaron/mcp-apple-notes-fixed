@@ -6,7 +6,6 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import * as lancedb from "@lancedb/lancedb";
-import { runJxa } from "run-jxa";
 import path from "node:path";
 import os from "node:os";
 import TurndownService from "turndown";
@@ -18,39 +17,89 @@ import {
 } from "@lancedb/lancedb/embedding";
 import { type Float, Float32, Utf8 } from "apache-arrow";
 import { pipeline } from "@huggingface/transformers";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { RecursiveCharacterTextSplitter } from "@langchain/textsplitters";
 
-const { turndown } = new TurndownService();
-const db = await lancedb.connect(
-  path.join(os.homedir(), ".mcp-apple-notes", "data")
-);
-const extractor = await pipeline(
-  "feature-extraction",
-  "Xenova/all-MiniLM-L6-v2"
-);
+// =============================================================================
+// Constants
+// =============================================================================
+
+const DATA_DIR = path.join(os.homedir(), ".mcp-apple-notes");
+const DB_PATH = path.join(DATA_DIR, "data");
+const TABLE_NAME = "notes";
+const MODEL_ID = "Xenova/bge-small-en-v1.5";
+const EMBEDDING_DIMS = 384;
+const CHUNK_SIZE = 1500;
+const CHUNK_OVERLAP = 200;
+const BATCH_SIZE = 5;
+const APPLESCRIPT_TIMEOUT = 600_000; // 10 minutes
+const APPLESCRIPT_MAX_BUFFER = 50 * 1024 * 1024; // 50 MB
+
+// =============================================================================
+// Logging (Change L)
+// =============================================================================
+
+type LogLevel = "INFO" | "WARN" | "ERROR";
+
+function log(level: LogLevel, message: string): void {
+  const timestamp = new Date().toISOString();
+  process.stderr.write(`[${timestamp}] [${level}] ${message}\n`);
+}
+
+// =============================================================================
+// Ensure data directory exists
+// =============================================================================
+
+await fs.mkdir(DATA_DIR, { recursive: true });
+
+// =============================================================================
+// Model and DB setup (Change A)
+// =============================================================================
+
+log("INFO", `Loading embedding model: ${MODEL_ID}...`);
+const extractor = await pipeline("feature-extraction", MODEL_ID);
+log("INFO", "Embedding model loaded.");
+
+const td = new TurndownService();
+const db = await lancedb.connect(DB_PATH);
+
+// =============================================================================
+// Text splitter for chunking (Change J)
+// =============================================================================
+
+const textSplitter = new RecursiveCharacterTextSplitter({
+  chunkSize: CHUNK_SIZE,
+  chunkOverlap: CHUNK_OVERLAP,
+  separators: ["\n## ", "\n### ", "\n#### ", "\n\n", "\n", ". ", " ", ""],
+});
+
+// =============================================================================
+// Embedding function (Change A)
+// =============================================================================
 
 @register("openai")
-export class OnDeviceEmbeddingFunction extends EmbeddingFunction<string> {
+class OnDeviceEmbeddingFunction extends EmbeddingFunction<string> {
   toJSON(): object {
     return {};
   }
   ndims() {
-    return 384;
+    return EMBEDDING_DIMS;
   }
   embeddingDataType(): Float {
     return new Float32();
   }
   async computeQueryEmbeddings(data: string) {
-    const output = await extractor(data, { pooling: "mean" });
+    const output = await extractor(data, { pooling: "mean", normalize: true });
     return output.data as number[];
   }
   async computeSourceEmbeddings(data: string[]) {
-    return await Promise.all(
-      data.map(async (item) => {
-        const output = await extractor(item, { pooling: "mean" });
-
-        return output.data as number[];
-      })
-    );
+    const results: number[][] = [];
+    for (const item of data) {
+      const output = await extractor(item, { pooling: "mean", normalize: true });
+      results.push(output.data as number[]);
+    }
+    return results;
   }
 }
 
@@ -64,531 +113,487 @@ const notesTableSchema = LanceSchema({
   vector: func.vectorField(),
 });
 
-const QueryNotesSchema = z.object({
-  query: z.string(),
-});
+// =============================================================================
+// AppleScript utilities (Changes E and I)
+// =============================================================================
 
-const GetNoteSchema = z.object({
-  title: z.string(),
-});
+const execFileAsync = promisify(execFile);
 
-const server = new Server(
-  {
-    name: "my-apple-notes-mcp",
-    version: "1.0.0",
-  },
-  {
-    capabilities: {
-      tools: {},
-    },
-  }
-);
-
-server.setRequestHandler(ListToolsRequestSchema, async () => {
-  return {
-    tools: [
-      {
-        name: "list-notes",
-        description: "Lists just the titles of all my Apple Notes",
-        inputSchema: {
-          type: "object",
-          properties: {},
-          required: [],
-        },
-      },
-      {
-        name: "index-notes",
-        description:
-          "Index all my Apple Notes for Semantic Search. Please tell the user that the sync takes couple of seconds up to couple of minutes depending on how many notes you have.",
-        inputSchema: {
-          type: "object",
-          properties: {},
-          required: [],
-        },
-      },
-      {
-        name: "get-note",
-        description: "Get a note full content and details by title",
-        inputSchema: {
-          type: "object",
-          properties: {
-            title: z.string(),
-          },
-          required: ["title"],
-        },
-      },
-      {
-        name: "search-notes",
-        description: "Search for notes by title or content. Returns ranked titles with relevance scores. Use get-note to fetch full content of specific results.",
-        inputSchema: {
-          type: "object",
-          properties: {
-            query: { type: "string" },
-          },
-          required: ["query"],
-        },
-      },
-      {
-        name: "create-note",
-        description:
-          "Create a new Apple Note with specified title and content. Must be in HTML format WITHOUT newlines",
-        inputSchema: {
-          type: "object",
-          properties: {
-            title: { type: "string" },
-            content: { type: "string" },
-          },
-          required: ["title", "content"],
-        },
-      },
-    ],
-  };
-});
-
-// Define the data directory
-const DATA_DIR = path.join(os.homedir(), ".mcp-apple-notes");
-const STATE_FILE = path.join(DATA_DIR, "indexing-state.json");
-
-// Create the data directory if it doesn't exist
-(async () => {
-  try {
-    await fs.mkdir(DATA_DIR, { recursive: true });
-  } catch (error) {
-    console.error(`Error creating data directory: ${error.message}`);
-  }
-})();
-
-// Define the indexing state interface
-interface IndexingState {
-  inProgress: boolean;
-  totalNotes: number;
-  processedNotes: number;
-  lastProcessedIndex: number;
-  startTime: number;
-  lastUpdateTime: number;
-  errors: string[];
-  batchSize: number;
+/**
+ * Escape a string for safe interpolation into an AppleScript double-quoted string.
+ * Handles backslashes, double quotes, and curly/smart quotes. (Change I)
+ */
+function escapeForAppleScript(str: string): string {
+  return str
+    .replace(/\\/g, "\\\\")
+    .replace(/"/g, '\\"')
+    .replace(/\u201C/g, '\\"')
+    .replace(/\u201D/g, '\\"')
+    .replace(/\r/g, "");
 }
 
-// Initialize default state
-const defaultState: IndexingState = {
-  inProgress: false,
-  totalNotes: 0,
-  processedNotes: 0,
-  lastProcessedIndex: -1,
-  startTime: 0,
-  lastUpdateTime: 0,
-  errors: [],
-  batchSize: 5,
-};
-
-// Function to read the current indexing state
-async function getIndexingState(): Promise<IndexingState> {
-  try {
-    const data = await fs.readFile(STATE_FILE, 'utf-8');
-    return JSON.parse(data) as IndexingState;
-  } catch (error) {
-    // If the file doesn't exist or can't be read, return the default state
-    return { ...defaultState };
-  }
+/** Run AppleScript via osascript with a generous timeout. (Change E) */
+async function runAppleScript(script: string): Promise<string> {
+  const { stdout } = await execFileAsync("osascript", ["-e", script], {
+    timeout: APPLESCRIPT_TIMEOUT,
+    maxBuffer: APPLESCRIPT_MAX_BUFFER,
+  });
+  return stdout.trim();
 }
 
-// Function to save the current indexing state
-async function saveIndexingState(state: IndexingState): Promise<void> {
-  try {
-    await fs.writeFile(STATE_FILE, JSON.stringify(state, null, 2), 'utf-8');
-  } catch (error) {
-    console.error(`Error saving indexing state: ${error.message}`);
-  }
-}
-
-// Function to get the status of the indexing process
-async function getIndexingStatus(): Promise<{
-  inProgress: boolean;
-  progress: number;
-  processedNotes: number;
-  totalNotes: number;
-  elapsedTime: number;
-  errors: string[];
-}> {
-  const state = await getIndexingState();
-  const progress = state.totalNotes > 0 
-    ? Math.round((state.processedNotes / state.totalNotes) * 100) 
-    : 0;
-  
-  return {
-    inProgress: state.inProgress,
-    progress,
-    processedNotes: state.processedNotes,
-    totalNotes: state.totalNotes,
-    elapsedTime: state.inProgress ? Date.now() - state.startTime : 0,
-    errors: state.errors,
-  };
-}
-
-const getNotes = async () => {
-  console.error("Executing JXA to get notes list...");
-  try {
-    const notes = await runJxa(`
-      try {
-        const app = Application('Notes');
-        app.includeStandardAdditions = true;
-        
-        const allNotes = Array.from(app.notes());
-        const titles = allNotes.map(note => note.properties().name);
-        
-        return titles;
-      } catch (error) {
-        return JSON.stringify({ error: error.toString() });
-      }
-    `);
-    
-    // Check if we got an error object
-    if (typeof notes === 'string' && notes.includes('"error":')) {
-      const errorObj = JSON.parse(notes);
-      console.error(`JXA error: ${errorObj.error}`);
-      return [];
-    }
-    
-    console.error(`JXA returned ${Array.isArray(notes) ? notes.length : 0} notes`);
-    return notes as string[];
-  } catch (error) {
-    console.error(`Error in getNotes: ${error.message}`);
-    return [];
-  }
-};
-
-const getNoteDetailsByTitle = async (title: string) => {
-  const note = await runJxa(
-    `const app = Application('Notes');
-    const title = "${title}"
-    
-    try {
-        const note = app.notes.whose({name: title})[0];
-        
-        const noteInfo = {
-            title: note.name(),
-            content: note.body(),
-            creation_date: note.creationDate().toLocaleString(),
-            modification_date: note.modificationDate().toLocaleString()
-        };
-        
-        return JSON.stringify(noteInfo);
-    } catch (error) {
-        return "{}";
-    }`
+/** Get all folder names from Apple Notes */
+async function getFolders(): Promise<string[]> {
+  log("INFO", "Fetching folder list from Apple Notes...");
+  const result = await runAppleScript(
+    `tell application "Notes" to return name of every folder`
   );
+  const folders = result.split(", ").map((f) => f.trim()).filter(Boolean);
+  log("INFO", `Found ${folders.length} folders.`);
+  return folders;
+}
 
-  return JSON.parse(note as string) as {
-    title: string;
-    content: string;
-    creation_date: string;
-    modification_date: string;
-  };
-};
+/** Get note count in a specific folder */
+async function getNoteCountInFolder(folderName: string): Promise<number> {
+  const safe = escapeForAppleScript(folderName);
+  const result = await runAppleScript(
+    `tell application "Notes" to return count of notes of folder "${safe}"`
+  );
+  return parseInt(result, 10);
+}
 
-// Background indexing function that processes notes in batches
-async function backgroundIndexNotes(notesTable: lancedb.Table): Promise<void> {
-  // Get the current state or initialize a new one
-  let state = await getIndexingState();
-  
-  // If indexing is already in progress, don't start again
-  if (state.inProgress) {
-    console.error("Indexing is already in progress");
-    return;
-  }
-  
-  // Initialize the state for a new indexing run
-  const allNotes = await getNotes();
-  state = {
-    ...defaultState,
-    inProgress: true,
-    totalNotes: allNotes.length,
-    startTime: Date.now(),
-    lastUpdateTime: Date.now(),
-  };
-  
-  // Save the initial state
-  await saveIndexingState(state);
-  
-  // Process notes in batches
-  console.error(`Starting background indexing of ${allNotes.length} notes in batches of ${state.batchSize}`);
-  
+/** Get a single note's full details by index within a folder (1-based) */
+async function getNoteByIndex(
+  folderName: string,
+  index: number
+): Promise<{
+  title: string;
+  content: string;
+  creation_date: string;
+  modification_date: string;
+} | null> {
+  const safeFolder = escapeForAppleScript(folderName);
   try {
-    for (let i = 0; i < allNotes.length; i += state.batchSize) {
-      // Update the state
-      state.lastProcessedIndex = i;
-      state.lastUpdateTime = Date.now();
-      await saveIndexingState(state);
-      
-      // Get the current batch
-      const batch = allNotes.slice(i, i + state.batchSize);
-      console.error(`Processing batch ${Math.floor(i/state.batchSize) + 1} of ${Math.ceil(allNotes.length/state.batchSize)}`);
-      
-      // Process the batch
-      const batchDetails = await Promise.all(
-        batch.map(async (noteTitle) => {
-          try {
-            console.error(`Getting details for note: "${noteTitle}"`);
-            const details = await getNoteDetailsByTitle(noteTitle);
-            return details;
-          } catch (error) {
-            const errorMsg = `Error getting note details for ${noteTitle}: ${error.message}`;
-            console.error(errorMsg);
-            state.errors.push(errorMsg);
-            return null;
-          }
-        })
-      );
-      
-      // Filter out null results and process the notes
-      const validDetails = batchDetails.filter(Boolean);
-      console.error(`Got ${validDetails.length} valid notes in this batch`);
-      
-      if (validDetails.length > 0) {
-        // Convert HTML to Markdown and prepare for database
-        const batchChunks = validDetails.map((note, index) => {
-          try {
-            // TypeScript non-null assertion to handle the null check we already did with filter(Boolean)
-            return {
-              id: (i + index).toString(),
-              title: note!.title || "Untitled",
-              content: note!.content ? turndown(note!.content) : "",
-              creation_date: note!.creation_date || new Date().toISOString(),
-              modification_date: note!.modification_date || new Date().toISOString(),
-            };
-          } catch (error) {
-            const errorMsg = `Error processing note ${note!.title}: ${error.message}`;
-            console.error(errorMsg);
-            state.errors.push(errorMsg);
-            return {
-              id: (i + index).toString(),
-              title: note!.title || "Untitled",
-              content: note!.content || "",
-              creation_date: note!.creation_date || new Date().toISOString(),
-              modification_date: note!.modification_date || new Date().toISOString(),
-            };
-          }
-        });
-        
-        // Add to database
-        try {
-          console.error(`Adding ${batchChunks.length} notes to database`);
-          await notesTable.add(batchChunks);
-          console.error("Successfully added batch to database");
-          
-          // Update progress
-          state.processedNotes += batchChunks.length;
-          await saveIndexingState(state);
-        } catch (error) {
-          const errorMsg = `Error adding batch to database: ${error.message}`;
-          console.error(errorMsg);
-          state.errors.push(errorMsg);
-        }
-      }
-      
-      // Small delay between batches to prevent overloading
-      await new Promise(resolve => setTimeout(resolve, 500));
-    }
-    
-    // Indexing complete
-    state.inProgress = false;
-    state.lastUpdateTime = Date.now();
-    await saveIndexingState(state);
-    console.error(`Indexing completed. Processed ${state.processedNotes} notes out of ${state.totalNotes}`);
-  } catch (error) {
-    // Handle any unexpected errors
-    const errorMsg = `Unexpected error during indexing: ${error.message}`;
-    console.error(errorMsg);
-    state.errors.push(errorMsg);
-    state.inProgress = false;
-    state.lastUpdateTime = Date.now();
-    await saveIndexingState(state);
+    const title = await runAppleScript(
+      `tell application "Notes" to return name of note ${index} of folder "${safeFolder}"`
+    );
+    const content = await runAppleScript(
+      `tell application "Notes" to return body of note ${index} of folder "${safeFolder}"`
+    );
+    const creationDate = await runAppleScript(
+      `tell application "Notes" to return creation date of note ${index} of folder "${safeFolder}" as string`
+    );
+    const modDate = await runAppleScript(
+      `tell application "Notes" to return modification date of note ${index} of folder "${safeFolder}" as string`
+    );
+    if (!title) return null;
+    return { title, content, creation_date: creationDate, modification_date: modDate };
+  } catch (error: any) {
+    log("WARN", `Failed to fetch note ${index} in "${folderName}": ${error.message}`);
+    return null;
   }
 }
 
-export const indexNotes = async (notesTable: any) => {
-  const start = performance.now();
-  let report = "";
-  const allNotes = (await getNotes()) || [];
-  const notesDetails = await Promise.all(
-    allNotes.map((note) => {
-      try {
-        return getNoteDetailsByTitle(note);
-      } catch (error) {
-        report += `Error getting note details for ${note}: ${error.message}\n`;
-        return {} as any;
-      }
-    })
-  );
+/** Get only title and modification_date for a note (lightweight, for incremental diff) */
+async function getNoteMetaByIndex(
+  folderName: string,
+  index: number
+): Promise<{ title: string; modification_date: string } | null> {
+  const safeFolder = escapeForAppleScript(folderName);
+  try {
+    const title = await runAppleScript(
+      `tell application "Notes" to return name of note ${index} of folder "${safeFolder}"`
+    );
+    const modDate = await runAppleScript(
+      `tell application "Notes" to return modification date of note ${index} of folder "${safeFolder}" as string`
+    );
+    if (!title) return null;
+    return { title, modification_date: modDate };
+  } catch (error: any) {
+    log("WARN", `Failed to fetch metadata for note ${index} in "${folderName}": ${error.message}`);
+    return null;
+  }
+}
 
-  const chunks = notesDetails
-    .filter((n) => n.title)
-    .map((node) => {
-      try {
-        return {
-          ...node,
-          content: turndown(node.content || ""), // this sometimes fails
-        };
-      } catch (error) {
-        return node;
-      }
-    })
-    .map((note, index) => ({
-      id: index.toString(),
-      title: note.title,
-      content: note.content, // turndown(note.content || ""),
-      creation_date: note.creation_date,
-      modification_date: note.modification_date,
-    }));
+/** Get a note's full details by title (used by get-note tool) */
+async function getNoteDetailsByTitle(title: string): Promise<{
+  title: string;
+  content: string;
+  creation_date: string;
+  modification_date: string;
+} | null> {
+  const safeTitle = escapeForAppleScript(title);
+  try {
+    const noteTitle = await runAppleScript(
+      `tell application "Notes"\nset theNote to first note whose name is "${safeTitle}"\nreturn name of theNote\nend tell`
+    );
+    const content = await runAppleScript(
+      `tell application "Notes"\nset theNote to first note whose name is "${safeTitle}"\nreturn body of theNote\nend tell`
+    );
+    const creationDate = await runAppleScript(
+      `tell application "Notes"\nset theNote to first note whose name is "${safeTitle}"\nreturn creation date of theNote as string\nend tell`
+    );
+    const modDate = await runAppleScript(
+      `tell application "Notes"\nset theNote to first note whose name is "${safeTitle}"\nreturn modification date of theNote as string\nend tell`
+    );
+    if (!noteTitle) return null;
+    return { title: noteTitle, content, creation_date: creationDate, modification_date: modDate };
+  } catch (error: any) {
+    log("WARN", `Failed to fetch note by title "${title}": ${error.message}`);
+    return null;
+  }
+}
 
-  await notesTable.add(chunks);
+/** Create a new note in Apple Notes */
+async function createNote(title: string, content: string): Promise<boolean> {
+  const safeTitle = escapeForAppleScript(title);
+  const safeContent = escapeForAppleScript(content).replace(/\n/g, "\\n");
+  try {
+    await runAppleScript(
+      `tell application "Notes"\nmake new note with properties {name:"${safeTitle}", body:"${safeContent}"}\nend tell`
+    );
+    return true;
+  } catch (error: any) {
+    log("ERROR", `Failed to create note "${title}": ${error.message}`);
+    return false;
+  }
+}
 
-  return {
-    chunks: chunks.length,
-    report,
-    allNotes: allNotes.length,
-    time: performance.now() - start,
-  };
-};
+// =============================================================================
+// Chunking helper (Change J)
+// =============================================================================
 
-export const createNotesTable = async (overrideName?: string) => {
+interface NoteChunk {
+  title: string;
+  content: string;
+  creation_date: string;
+  modification_date: string;
+}
+
+/**
+ * Convert a note's HTML content to Markdown and split into chunks.
+ * Each chunk shares the same title/creation_date/modification_date as the parent note.
+ */
+async function chunkNote(note: {
+  title: string;
+  content: string;
+  creation_date: string;
+  modification_date: string;
+}): Promise<NoteChunk[]> {
+  let markdown: string;
+  try {
+    markdown = note.content ? td.turndown(note.content) : "";
+  } catch {
+    markdown = note.content || "";
+  }
+
+  if (!markdown || markdown.trim().length === 0) {
+    return [{
+      title: note.title || "Untitled",
+      content: "",
+      creation_date: note.creation_date || new Date().toISOString(),
+      modification_date: note.modification_date || new Date().toISOString(),
+    }];
+  }
+
+  const chunks = await textSplitter.splitText(markdown);
+  return chunks.map((chunk) => ({
+    title: note.title || "Untitled",
+    content: chunk,
+    creation_date: note.creation_date || new Date().toISOString(),
+    modification_date: note.modification_date || new Date().toISOString(),
+  }));
+}
+
+// =============================================================================
+// Table management (Change K)
+// =============================================================================
+
+async function createNotesTable(overrideName?: string): Promise<{ notesTable: lancedb.Table; time: number }> {
   const start = performance.now();
   const notesTable = await db.createEmptyTable(
-    overrideName || "notes",
+    overrideName || TABLE_NAME,
     notesTableSchema,
-    {
-      mode: "create",
-      existOk: true,
-    }
+    { mode: "create", existOk: true }
   );
+  await ensureFtsIndex(notesTable);
+  return { notesTable, time: performance.now() - start };
+}
 
-  const indices = await notesTable.listIndices();
-  if (!indices.find((index) => index.name === "content_idx")) {
+async function ensureFtsIndex(notesTable: lancedb.Table): Promise<void> {
+  try {
+    const indices = await notesTable.listIndices();
+    if (!indices.find((index) => index.name === "content_idx")) {
+      await notesTable.createIndex("content", {
+        config: lancedb.Index.fts(),
+        replace: true,
+      });
+    }
+  } catch (error: any) {
+    log("WARN", `Failed to ensure FTS index: ${error.message}`);
+  }
+}
+
+async function rebuildFtsIndex(notesTable: lancedb.Table): Promise<void> {
+  try {
     await notesTable.createIndex("content", {
       config: lancedb.Index.fts(),
       replace: true,
     });
+    log("INFO", "FTS index rebuilt.");
+  } catch (error: any) {
+    log("WARN", `Failed to rebuild FTS index: ${error.message}`);
   }
-  return { notesTable, time: performance.now() - start };
-};
+}
 
-const createNote = async (title: string, content: string) => {
-  // Escape special characters and convert newlines to \n
-  const escapedTitle = title.replace(/[\\'"]/g, "\\$&");
-  const escapedContent = content
-    .replace(/[\\'"]/g, "\\$&")
-    .replace(/\n/g, "\\n")
-    .replace(/\r/g, "");
+// =============================================================================
+// Incremental indexing (Changes B, C, D, J, K)
+// =============================================================================
 
-  await runJxa(`
-    const app = Application('Notes');
-    const note = app.make({new: 'note', withProperties: {
-      name: "${escapedTitle}",
-      body: "${escapedContent}"
-    }});
-    
-    return true
-  `);
+/** Fetch all note metadata from Apple Notes (folder-by-folder to avoid timeouts) */
+async function fetchAllNoteMeta(): Promise<Map<string, string>> {
+  const notesMeta = new Map<string, string>();
+  const folders = await getFolders();
 
-  return true;
-};
+  for (const folder of folders) {
+    let noteCount: number;
+    try {
+      noteCount = await getNoteCountInFolder(folder);
+    } catch (error: any) {
+      log("WARN", `Skipping folder "${folder}": ${error.message}`);
+      continue;
+    }
+    if (noteCount === 0) continue;
 
-// Handle tool execution
-server.setRequestHandler(CallToolRequestSchema, async (request, c) => {
+    for (let i = 1; i <= noteCount; i++) {
+      const meta = await getNoteMetaByIndex(folder, i);
+      if (meta && meta.title) {
+        notesMeta.set(meta.title, meta.modification_date);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+  }
+
+  return notesMeta;
+}
+
+/** Get indexed notes metadata from LanceDB (groups by title) */
+async function getIndexedNoteMeta(notesTable: lancedb.Table): Promise<Map<string, string>> {
+  const indexed = new Map<string, string>();
+  try {
+    const rows = await notesTable
+      .search("")
+      .select(["title", "modification_date"])
+      .limit(100000)
+      .toArray();
+    for (const row of rows) {
+      if (row.title && !indexed.has(row.title)) {
+        indexed.set(row.title, row.modification_date);
+      }
+    }
+  } catch (error: any) {
+    log("WARN", `Could not read indexed metadata: ${error.message}`);
+  }
+  return indexed;
+}
+
+/** Run incremental indexing: only process new, modified, and deleted notes */
+async function incrementalIndexNotes(notesTable: lancedb.Table): Promise<{
+  added: number;
+  modified: number;
+  deleted: number;
+  errors: number;
+}> {
+  const startTime = Date.now();
+  log("INFO", "Starting incremental index update...");
+
+  const [appleNotesMeta, indexedMeta] = await Promise.all([
+    fetchAllNoteMeta(),
+    getIndexedNoteMeta(notesTable),
+  ]);
+
+  log("INFO", `Apple Notes: ${appleNotesMeta.size} notes. Index: ${indexedMeta.size} titles.`);
+
+  const newTitles: string[] = [];
+  const modifiedTitles: string[] = [];
+  const deletedTitles: string[] = [];
+
+  for (const [title, modDate] of appleNotesMeta) {
+    if (!indexedMeta.has(title)) {
+      newTitles.push(title);
+    } else if (indexedMeta.get(title) !== modDate) {
+      modifiedTitles.push(title);
+    }
+  }
+
+  for (const title of indexedMeta.keys()) {
+    if (!appleNotesMeta.has(title)) {
+      deletedTitles.push(title);
+    }
+  }
+
+  log("INFO", `Changes: ${newTitles.length} new, ${modifiedTitles.length} modified, ${deletedTitles.length} deleted.`);
+
+  if (newTitles.length === 0 && modifiedTitles.length === 0 && deletedTitles.length === 0) {
+    log("INFO", "Index is up to date.");
+    return { added: 0, modified: 0, deleted: 0, errors: 0 };
+  }
+
+  let errors = 0;
+
+  // Delete all chunks for deleted and modified notes
+  const titlesToRemove = [...deletedTitles, ...modifiedTitles];
+  for (const title of titlesToRemove) {
+    try {
+      const safeTitle = title.replace(/'/g, "''");
+      await notesTable.delete(`title = '${safeTitle}'`);
+      log("INFO", `Removed chunks for: "${title}"`);
+    } catch (error: any) {
+      log("ERROR", `Failed to delete chunks for "${title}": ${error.message}`);
+      errors++;
+    }
+  }
+
+  // Fetch, chunk, and insert new and modified notes
+  const titlesToAdd = [...newTitles, ...modifiedTitles];
+  for (let i = 0; i < titlesToAdd.length; i += BATCH_SIZE) {
+    const batch = titlesToAdd.slice(i, i + BATCH_SIZE);
+    const allChunks: NoteChunk[] = [];
+
+    for (const title of batch) {
+      try {
+        const note = await getNoteDetailsByTitle(title);
+        if (!note) {
+          log("WARN", `Could not fetch note "${title}" for indexing.`);
+          errors++;
+          continue;
+        }
+        const chunks = await chunkNote(note);
+        allChunks.push(...chunks);
+        log("INFO", `Chunked "${title}" into ${chunks.length} chunk(s).`);
+      } catch (error: any) {
+        log("ERROR", `Error processing "${title}": ${error.message}`);
+        errors++;
+      }
+    }
+
+    if (allChunks.length > 0) {
+      try {
+        await notesTable.add(allChunks);
+        log("INFO", `Inserted ${allChunks.length} chunks for batch ${Math.floor(i / BATCH_SIZE) + 1}.`);
+      } catch (error: any) {
+        log("ERROR", `Failed to insert batch: ${error.message}`);
+        errors += allChunks.length;
+      }
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 300));
+  }
+
+  await rebuildFtsIndex(notesTable);
+
+  const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+  log("INFO", `Incremental update complete in ${elapsed}s. Added: ${newTitles.length}, Modified: ${modifiedTitles.length}, Deleted: ${deletedTitles.length}, Errors: ${errors}.`);
+
+  return { added: newTitles.length, modified: modifiedTitles.length, deleted: deletedTitles.length, errors };
+}
+
+// =============================================================================
+// Zod schemas
+// =============================================================================
+
+const QueryNotesSchema = z.object({ query: z.string() });
+const GetNoteSchema = z.object({ title: z.string() });
+const CreateNoteSchema = z.object({ title: z.string(), content: z.string() });
+
+// =============================================================================
+// MCP Server
+// =============================================================================
+
+const server = new Server(
+  { name: "my-apple-notes-mcp", version: "2.0.0" },
+  { capabilities: { tools: {} } }
+);
+
+server.setRequestHandler(ListToolsRequestSchema, async () => ({
+  tools: [
+    {
+      name: "list-notes",
+      description: "Lists just the titles of all my Apple Notes",
+      inputSchema: { type: "object", properties: {}, required: [] },
+    },
+    {
+      name: "index-notes",
+      description: "Incrementally update the Apple Notes search index. Only re-indexes new, modified, and deleted notes. Runs automatically on server startup, but can be triggered manually.",
+      inputSchema: { type: "object", properties: {}, required: [] },
+    },
+    {
+      name: "get-note",
+      description: "Get a note full content and details by title",
+      inputSchema: { type: "object", properties: { title: z.string() }, required: ["title"] },
+    },
+    {
+      name: "search-notes",
+      description: "Search for notes by title or content. Returns ranked titles with relevance scores. Use get-note to fetch full content of specific results.",
+      inputSchema: { type: "object", properties: { query: { type: "string" } }, required: ["query"] },
+    },
+    {
+      name: "create-note",
+      description: "Create a new Apple Note with specified title and content. Must be in HTML format WITHOUT newlines",
+      inputSchema: { type: "object", properties: { title: { type: "string" }, content: { type: "string" } }, required: ["title", "content"] },
+    },
+  ],
+}));
+
+server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { notesTable } = await createNotesTable();
   const { name, arguments: args } = request.params;
 
   try {
     if (name === "create-note") {
       const { title, content } = CreateNoteSchema.parse(args);
-      await createNote(title, content);
-      return createTextResponse(`Created note "${title}" successfully.`);
+      const success = await createNote(title, content);
+      return createTextResponse(success ? `Created note "${title}" successfully.` : `Failed to create note "${title}".`);
     } else if (name === "list-notes") {
-      return createTextResponse(
-        `There are ${await notesTable.countRows()} notes in your Apple Notes database.`
-      );
-    } else if (name == "get-note") {
-      try {
-        const { title } = GetNoteSchema.parse(args);
-        const note = await getNoteDetailsByTitle(title);
-
-        return createTextResponse(JSON.stringify(note));
-      } catch (error) {
-        return createTextResponse(error.message);
-      }
+      const count = await notesTable.countRows();
+      return createTextResponse(`There are ${count} note chunks in your Apple Notes search index.`);
+    } else if (name === "get-note") {
+      const { title } = GetNoteSchema.parse(args);
+      const note = await getNoteDetailsByTitle(title);
+      return createTextResponse(JSON.stringify(note));
     } else if (name === "index-notes") {
-      // Start the background indexing process
-      const status = await getIndexingStatus();
-      
-      if (status.inProgress) {
-        return createTextResponse(
-          `Indexing is already in progress. Progress: ${status.progress}% (${status.processedNotes}/${status.totalNotes} notes processed)`
-        );
-      }
-      
-      // Start the background indexing process
-      backgroundIndexNotes(notesTable).catch(error => {
-        console.error(`Background indexing error: ${error.message}`);
-      });
-      
-      return createTextResponse(
-        `Started indexing your Apple Notes in the background. This process will continue even if you close this chat. You can check the status by using the "index-notes" tool again.`
-      );
+      const result = await incrementalIndexNotes(notesTable);
+      return createTextResponse(`Incremental index update complete. Added: ${result.added}, Modified: ${result.modified}, Deleted: ${result.deleted}, Errors: ${result.errors}.`);
     } else if (name === "search-notes") {
       const { query } = QueryNotesSchema.parse(args);
-      const combinedResults = await searchAndCombineResults(notesTable, query);
-      return createTextResponse(JSON.stringify(combinedResults));
+      const results = await searchAndCombineResults(notesTable, query);
+      return createTextResponse(JSON.stringify(results));
     } else {
       throw new Error(`Unknown tool: ${name}`);
     }
-  } catch (error) {
+  } catch (error: any) {
     if (error instanceof z.ZodError) {
-      throw new Error(
-        `Invalid arguments: ${error.errors
-          .map((e) => `${e.path.join(".")}: ${e.message}`)
-          .join(", ")}`
-      );
+      throw new Error(`Invalid arguments: ${error.errors.map((e) => `${e.path.join(".")}: ${e.message}`).join(", ")}`);
     }
     throw error;
   }
 });
 
-// Start the server
-const transport = new StdioServerTransport();
-await server.connect(transport);
-console.error("Local Machine MCP Server running on stdio");
+// =============================================================================
+// Search
+// =============================================================================
 
 const createTextResponse = (text: string) => ({
-  content: [{ type: "text", text }],
+  content: [{ type: "text" as const, text }],
 });
 
-/**
- * Search for notes by title or content using both vector and FTS search.
- * The results are combined using RRF.
- * Returns only titles and relevance scores to stay under the 1MB MCP response
- * limit. Use the "get-note" tool to fetch full content for specific results.
- */
 export const searchAndCombineResults = async (
   notesTable: lancedb.Table,
   query: string,
   limit = 10
 ) => {
   const [vectorResults, ftsSearchResults] = await Promise.all([
-    (async () => {
-      const results = await notesTable
-        .search(query, "vector")
-        .limit(limit)
-        .toArray();
-      return results;
-    })(),
-    (async () => {
-      const results = await notesTable
-        .search(query, "fts", "content")
-        .limit(limit)
-        .toArray();
-      return results;
-    })(),
+    notesTable.search(query, "vector").limit(limit * 3).toArray(),
+    notesTable.search(query, "fts", "content").limit(limit * 3).toArray(),
   ]);
 
   const k = 60;
@@ -610,18 +615,30 @@ export const searchAndCombineResults = async (
   processResults(vectorResults, 0);
   processResults(ftsSearchResults, 0);
 
-  const results = Array.from(scores.values())
+  return Array.from(scores.values())
     .sort((a, b) => b.score - a.score)
     .slice(0, limit)
     .map(({ title, score }) => ({
       title,
       relevance: Math.round(score * 10000) / 10000,
     }));
-
-  return results;
 };
 
-const CreateNoteSchema = z.object({
-  title: z.string(),
-  content: z.string(),
-});
+// =============================================================================
+// Start server and run startup indexing (Changes C and M)
+// =============================================================================
+
+const transport = new StdioServerTransport();
+await server.connect(transport);
+log("INFO", "MCP Apple Notes server v2.0.0 running on stdio.");
+
+// Auto-index on startup with graceful failure handling
+(async () => {
+  try {
+    const { notesTable } = await createNotesTable();
+    await incrementalIndexNotes(notesTable);
+  } catch (error: any) {
+    log("WARN", `Startup indexing failed (Apple Notes may be unavailable): ${error.message}`);
+    log("WARN", "Server is running. Use the index-notes tool to retry later.");
+  }
+})();
