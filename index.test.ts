@@ -271,6 +271,138 @@ describe("N4: Search result size", () => {
 });
 
 // =============================================================================
+// Test N6: fetchAllNoteMeta bulk output parsing
+// =============================================================================
+
+describe("N6: fetchAllNoteMeta bulk output parsing", () => {
+  // Inlined from index.ts for test isolation
+  function parseBulkNoteMeta(result: string): Map<string, string> {
+    const notesMeta = new Map<string, string>();
+    if (!result) return notesMeta;
+    for (const entry of result.split("~~~")) {
+      const trimmed = entry.trim();
+      if (!trimmed) continue;
+      const sepIdx = trimmed.indexOf("|||");
+      if (sepIdx !== -1) {
+        const title = trimmed.substring(0, sepIdx).trim();
+        const modDate = trimmed.substring(sepIdx + 3).trim();
+        if (title) notesMeta.set(title, modDate);
+      }
+    }
+    return notesMeta;
+  }
+
+  it("should parse a single note entry", () => {
+    const result = "My Note|||Tuesday, April 8, 2025 at 10:00:00 AM~~~";
+    const meta = parseBulkNoteMeta(result);
+    expect(meta.size).toBe(1);
+    expect(meta.get("My Note")).toBe("Tuesday, April 8, 2025 at 10:00:00 AM");
+  });
+
+  it("should parse multiple note entries", () => {
+    const result = "Note A|||date1~~~Note B|||date2~~~Note C|||date3~~~";
+    const meta = parseBulkNoteMeta(result);
+    expect(meta.size).toBe(3);
+    expect(meta.get("Note A")).toBe("date1");
+    expect(meta.get("Note B")).toBe("date2");
+    expect(meta.get("Note C")).toBe("date3");
+  });
+
+  it("should return empty map for empty result", () => {
+    expect(parseBulkNoteMeta("").size).toBe(0);
+  });
+
+  it("should skip entries with no ||| separator", () => {
+    const result = "ValidNote|||date1~~~malformed-entry~~~Note B|||date2~~~";
+    const meta = parseBulkNoteMeta(result);
+    expect(meta.size).toBe(2);
+    expect(meta.get("ValidNote")).toBe("date1");
+    expect(meta.get("Note B")).toBe("date2");
+  });
+
+  it("should skip entries with empty title", () => {
+    const result = "|||date1~~~Real Note|||date2~~~";
+    const meta = parseBulkNoteMeta(result);
+    expect(meta.size).toBe(1);
+    expect(meta.get("Real Note")).toBe("date2");
+  });
+
+  it("should handle titles with single pipe characters (not a delimiter)", () => {
+    const result = "Note with | pipe|||date1~~~";
+    const meta = parseBulkNoteMeta(result);
+    expect(meta.size).toBe(1);
+    expect(meta.get("Note with | pipe")).toBe("date1");
+  });
+
+  it("should trim whitespace around titles and dates", () => {
+    const result = "  My Note  |||  some date  ~~~";
+    const meta = parseBulkNoteMeta(result);
+    expect(meta.get("My Note")).toBe("some date");
+  });
+
+  it("should keep last occurrence when a title appears multiple times", () => {
+    const result = "Duplicate|||date1~~~Duplicate|||date2~~~";
+    const meta = parseBulkNoteMeta(result);
+    expect(meta.size).toBe(1);
+    expect(meta.get("Duplicate")).toBe("date2");
+  });
+});
+
+// =============================================================================
+// Test N7: getNoteDetailsByTitle meta parsing
+// =============================================================================
+
+describe("N7: getNoteDetailsByTitle meta parsing", () => {
+  // Inlined from index.ts for test isolation
+  function parseNoteMeta(meta: string): {
+    title: string;
+    creation_date: string;
+    modification_date: string;
+  } | null {
+    if (!meta) return null;
+    const parts = meta.split("|||");
+    if (parts.length < 3) return null;
+    return {
+      title: parts[0].trim(),
+      creation_date: parts[1].trim(),
+      modification_date: parts[2].trim(),
+    };
+  }
+
+  it("should parse all three fields", () => {
+    const meta = "My Note|||Tuesday, January 1, 2025 at 9:00:00 AM|||Wednesday, April 8, 2026 at 10:00:00 AM";
+    const result = parseNoteMeta(meta);
+    expect(result).not.toBeNull();
+    expect(result!.title).toBe("My Note");
+    expect(result!.creation_date).toBe("Tuesday, January 1, 2025 at 9:00:00 AM");
+    expect(result!.modification_date).toBe("Wednesday, April 8, 2026 at 10:00:00 AM");
+  });
+
+  it("should return null for empty string", () => {
+    expect(parseNoteMeta("")).toBeNull();
+  });
+
+  it("should return null when fewer than 3 parts", () => {
+    expect(parseNoteMeta("Title Only")).toBeNull();
+    expect(parseNoteMeta("Title|||creation_date_only")).toBeNull();
+  });
+
+  it("should trim whitespace from each field", () => {
+    const meta = "  Note Title  |||  date1  |||  date2  ";
+    const result = parseNoteMeta(meta);
+    expect(result!.title).toBe("Note Title");
+    expect(result!.creation_date).toBe("date1");
+    expect(result!.modification_date).toBe("date2");
+  });
+
+  it("should handle titles with single pipe characters", () => {
+    const meta = "Note | with pipe|||date1|||date2";
+    const result = parseNoteMeta(meta);
+    expect(result!.title).toBe("Note | with pipe");
+  });
+});
+
+// =============================================================================
 // Test N5: Chunking correctness
 // =============================================================================
 
