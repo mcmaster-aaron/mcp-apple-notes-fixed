@@ -240,7 +240,7 @@ async function getNoteDetailsByTitle(title: string): Promise<{
 // Chunking helper (Change J)
 // =============================================================================
 
-interface NoteChunk {
+interface NoteChunk extends Record<string, unknown> {
   title: string;
   content: string;
   creation_date: string;

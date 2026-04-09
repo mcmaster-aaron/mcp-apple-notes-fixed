@@ -1,0 +1,14 @@
+{
+  "compilerOptions": {
+    "target": "ESNext",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "lib": ["ESNext"],
+    "types": ["@types/bun"],
+    "strict": true,
+    "skipLibCheck": true,
+    "experimentalDecorators": true
+  },
+  "include": ["*.ts"],
+  "exclude": ["node_modules", "dist"]
+}
