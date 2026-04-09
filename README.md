@@ -25,7 +25,7 @@ A [Model Context Protocol (MCP)](https://www.anthropic.com/news/model-context-pr
 | Feature | Original | This fork |
 |---|---|---|
 | Embedding model | `all-MiniLM-L6-v2` (22M params, 256-token context) | `bge-small-en-v1.5` (33M params, 512-token context) |
-| Apple Notes access | JXA via `run-jxa` (times out on large libraries) | AppleScript via `osascript` with folder-by-folder fetching |
+| Apple Notes access | JXA via `run-jxa` (times out on large libraries) | AppleScript via `osascript`; metadata fetched in a single bulk call, content fetched per-note only when needed |
 | Indexing | Full rebuild every time, background batch processing | Incremental: only re-embeds new/modified notes, removes deleted |
 | Content handling | Whole note as single embedding (truncated at context window) | Markdown-aware chunking with overlap (no content lost) |
 | Search results | Returns full content (exceeds 1MB MCP limit on large libraries) | Returns titles + relevance scores (use `get-note` for full content) |
@@ -186,6 +186,8 @@ The test suite includes:
 - **Incremental indexing logic**: Validates correct classification of new, modified, and deleted notes.
 - **Search result size**: Asserts that search responses stay under the 1MB MCP response limit.
 - **Content chunking**: Verifies chunk sizes, overlap, content preservation, and Markdown-aware splitting.
+- **Bulk metadata parsing**: Validates the `title|||modDate~~~` format parser used by the single-call AppleScript metadata fetch.
+- **Note meta parsing**: Validates the `title|||creation_date|||mod_date` format parser used when fetching individual note details.
 
 > **Note:** The embedding dimension test downloads the model on first run and may take up to 2 minutes.
 
@@ -258,7 +260,7 @@ Then restart the MCP server.
 - **Incremental by default.** The MCP server indexes on startup, and only processes what changed. For a 1,500-note collection where a handful change between restarts, this takes seconds instead of minutes.
 - **Chunked embeddings.** Long notes are split into overlapping chunks (1,500 chars with 200-char overlap) using Markdown-aware splitting. Each chunk is a separate row in LanceDB sharing the parent note's title and modification date. This ensures every part of every note is searchable.
 - **Two-stage search.** `search-notes` returns lightweight title + relevance results (never exceeds 1MB). `get-note` fetches full content from Apple Notes directly (not from the index). This decouples search from retrieval and avoids the MCP response size limit.
-- **Folder-by-folder AppleScript.** Apple Notes' JXA/AppleScript interface times out on large libraries when fetching all notes at once. We iterate folder by folder, note by note, with individual `osascript` calls and generous timeouts.
+- **Bulk AppleScript metadata fetch.** All note titles and modification dates are fetched in a single `osascript` call that iterates folders and notes internally, returning a delimited string parsed in JS. This replaces the prior per-note approach (which spawned one process per note plus a 100ms sleep between each). Full note content (HTML body) is still fetched per-note when re-indexing is required.
 
 ## License
 
