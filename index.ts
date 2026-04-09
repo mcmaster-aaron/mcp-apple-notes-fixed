@@ -317,7 +317,7 @@ async function getIndexedNoteMeta(notesTable: lancedb.Table): Promise<Map<string
   const indexed = new Map<string, string>();
   try {
     const rows = await notesTable
-      .search("")
+      .query()
       .select(["title", "modification_date"])
       .limit(100000)
       .toArray();
