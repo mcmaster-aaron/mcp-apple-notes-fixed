@@ -94,12 +94,12 @@ class OnDeviceEmbeddingFunction extends EmbeddingFunction<string> {
     return output.data as number[];
   }
   async computeSourceEmbeddings(data: string[]) {
-    const results: number[][] = [];
-    for (const item of data) {
-      const output = await extractor(item, { pooling: "mean", normalize: true });
-      results.push(output.data as number[]);
-    }
-    return results;
+    return Promise.all(
+      data.map(async (item) => {
+        const output = await extractor(item, { pooling: "mean", normalize: true });
+        return output.data as number[];
+      })
+    );
   }
 }
 
@@ -141,80 +141,7 @@ async function runAppleScript(script: string): Promise<string> {
   return stdout.trim();
 }
 
-/** Get all folder names from Apple Notes */
-async function getFolders(): Promise<string[]> {
-  log("INFO", "Fetching folder list from Apple Notes...");
-  const result = await runAppleScript(
-    `tell application "Notes" to return name of every folder`
-  );
-  const folders = result.split(", ").map((f) => f.trim()).filter(Boolean);
-  log("INFO", `Found ${folders.length} folders.`);
-  return folders;
-}
-
-/** Get note count in a specific folder */
-async function getNoteCountInFolder(folderName: string): Promise<number> {
-  const safe = escapeForAppleScript(folderName);
-  const result = await runAppleScript(
-    `tell application "Notes" to return count of notes of folder "${safe}"`
-  );
-  return parseInt(result, 10);
-}
-
-/** Get a single note's full details by index within a folder (1-based) */
-async function getNoteByIndex(
-  folderName: string,
-  index: number
-): Promise<{
-  title: string;
-  content: string;
-  creation_date: string;
-  modification_date: string;
-} | null> {
-  const safeFolder = escapeForAppleScript(folderName);
-  try {
-    const title = await runAppleScript(
-      `tell application "Notes" to return name of note ${index} of folder "${safeFolder}"`
-    );
-    const content = await runAppleScript(
-      `tell application "Notes" to return body of note ${index} of folder "${safeFolder}"`
-    );
-    const creationDate = await runAppleScript(
-      `tell application "Notes" to return creation date of note ${index} of folder "${safeFolder}" as string`
-    );
-    const modDate = await runAppleScript(
-      `tell application "Notes" to return modification date of note ${index} of folder "${safeFolder}" as string`
-    );
-    if (!title) return null;
-    return { title, content, creation_date: creationDate, modification_date: modDate };
-  } catch (error: any) {
-    log("WARN", `Failed to fetch note ${index} in "${folderName}": ${error.message}`);
-    return null;
-  }
-}
-
-/** Get only title and modification_date for a note (lightweight, for incremental diff) */
-async function getNoteMetaByIndex(
-  folderName: string,
-  index: number
-): Promise<{ title: string; modification_date: string } | null> {
-  const safeFolder = escapeForAppleScript(folderName);
-  try {
-    const title = await runAppleScript(
-      `tell application "Notes" to return name of note ${index} of folder "${safeFolder}"`
-    );
-    const modDate = await runAppleScript(
-      `tell application "Notes" to return modification date of note ${index} of folder "${safeFolder}" as string`
-    );
-    if (!title) return null;
-    return { title, modification_date: modDate };
-  } catch (error: any) {
-    log("WARN", `Failed to fetch metadata for note ${index} in "${folderName}": ${error.message}`);
-    return null;
-  }
-}
-
-/** Get a note's full details by title (used by get-note tool) */
+/** Get a note's full details by title in a single AppleScript call */
 async function getNoteDetailsByTitle(title: string): Promise<{
   title: string;
   content: string;
@@ -223,20 +150,20 @@ async function getNoteDetailsByTitle(title: string): Promise<{
 } | null> {
   const safeTitle = escapeForAppleScript(title);
   try {
-    const noteTitle = await runAppleScript(
-      `tell application "Notes"\nset theNote to first note whose name is "${safeTitle}"\nreturn name of theNote\nend tell`
+    // Fetch name, creation_date, mod_date together; body separately to avoid
+    // delimiter collisions with arbitrary HTML content.
+    const meta = await runAppleScript(
+      `tell application "Notes"\n` +
+      `set n to first note whose name is "${safeTitle}"\n` +
+      `return (name of n) & "|||" & (creation date of n as string) & "|||" & (modification date of n as string)\n` +
+      `end tell`
     );
+    if (!meta) return null;
+    const [noteTitle, creationDate, modDate] = meta.split("|||");
     const content = await runAppleScript(
-      `tell application "Notes"\nset theNote to first note whose name is "${safeTitle}"\nreturn body of theNote\nend tell`
+      `tell application "Notes"\nreturn body of (first note whose name is "${safeTitle}")\nend tell`
     );
-    const creationDate = await runAppleScript(
-      `tell application "Notes"\nset theNote to first note whose name is "${safeTitle}"\nreturn creation date of theNote as string\nend tell`
-    );
-    const modDate = await runAppleScript(
-      `tell application "Notes"\nset theNote to first note whose name is "${safeTitle}"\nreturn modification date of theNote as string\nend tell`
-    );
-    if (!noteTitle) return null;
-    return { title: noteTitle, content, creation_date: creationDate, modification_date: modDate };
+    return { title: noteTitle.trim(), content, creation_date: creationDate.trim(), modification_date: modDate.trim() };
   } catch (error: any) {
     log("WARN", `Failed to fetch note by title "${title}": ${error.message}`);
     return null;
@@ -262,7 +189,7 @@ async function createNote(title: string, content: string): Promise<boolean> {
 // Chunking helper (Change J)
 // =============================================================================
 
-interface NoteChunk {
+interface NoteChunk extends Record<string, unknown> {
   title: string;
   content: string;
   creation_date: string;
@@ -349,30 +276,39 @@ async function rebuildFtsIndex(notesTable: lancedb.Table): Promise<void> {
 // Incremental indexing (Changes B, C, D, J, K)
 // =============================================================================
 
-/** Fetch all note metadata from Apple Notes (folder-by-folder to avoid timeouts) */
+/** Fetch all note metadata from Apple Notes in a single AppleScript call */
 async function fetchAllNoteMeta(): Promise<Map<string, string>> {
   const notesMeta = new Map<string, string>();
-  const folders = await getFolders();
+  log("INFO", "Fetching all note metadata in a single AppleScript call...");
 
-  for (const folder of folders) {
-    let noteCount: number;
-    try {
-      noteCount = await getNoteCountInFolder(folder);
-    } catch (error: any) {
-      log("WARN", `Skipping folder "${folder}": ${error.message}`);
-      continue;
-    }
-    if (noteCount === 0) continue;
+  const result = await runAppleScript(
+    `tell application "Notes"\n` +
+    `set output to ""\n` +
+    `repeat with f in (every folder)\n` +
+    `if (count of notes of f) > 0 then\n` +
+    `repeat with n in (every note of f)\n` +
+    `set output to output & (name of n) & "|||" & ((modification date of n) as string) & "~~~"\n` +
+    `end repeat\n` +
+    `end if\n` +
+    `end repeat\n` +
+    `return output\n` +
+    `end tell`
+  );
 
-    for (let i = 1; i <= noteCount; i++) {
-      const meta = await getNoteMetaByIndex(folder, i);
-      if (meta && meta.title) {
-        notesMeta.set(meta.title, meta.modification_date);
+  if (result) {
+    for (const entry of result.split("~~~")) {
+      const trimmed = entry.trim();
+      if (!trimmed) continue;
+      const sepIdx = trimmed.indexOf("|||");
+      if (sepIdx !== -1) {
+        const title = trimmed.substring(0, sepIdx).trim();
+        const modDate = trimmed.substring(sepIdx + 3).trim();
+        if (title) notesMeta.set(title, modDate);
       }
-      await new Promise((resolve) => setTimeout(resolve, 100));
     }
   }
 
+  log("INFO", `Found ${notesMeta.size} notes.`);
   return notesMeta;
 }
 
