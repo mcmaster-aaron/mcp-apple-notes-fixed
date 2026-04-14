@@ -465,7 +465,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "get-note",
       description: "Get a note full content and details by title",
-      inputSchema: { type: "object", properties: { title: z.string() }, required: ["title"] },
+      inputSchema: { type: "object", properties: { title: { type: "string" } }, required: ["title"] },
     },
     {
       name: "search-notes",
