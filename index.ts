@@ -19,6 +19,7 @@ import { type Float, Float32, Utf8 } from "apache-arrow";
 import { pipeline } from "@huggingface/transformers";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { RecursiveCharacterTextSplitter } from "@langchain/textsplitters";
 
 // =============================================================================
@@ -26,6 +27,7 @@ import { RecursiveCharacterTextSplitter } from "@langchain/textsplitters";
 // =============================================================================
 
 const DATA_DIR = path.join(os.homedir(), ".mcp-apple-notes");
+const HTTP_PORT = 7891;
 const DB_PATH = path.join(DATA_DIR, "data");
 const TABLE_NAME = "notes";
 const MODEL_ID = "Xenova/bge-small-en-v1.5";
@@ -559,6 +561,113 @@ export const searchAndCombineResults = async (
       relevance: Math.round(score * 10000) / 10000,
     }));
 };
+
+// =============================================================================
+// HTTP proxy — Notes writes from processes without direct Apple Events access
+// =============================================================================
+
+async function updateNote(folder: string, title: string, content: string): Promise<string> {
+  const sf = escapeForAppleScript(folder);
+  const st = escapeForAppleScript(title);
+  const sc = escapeForAppleScript(content).replace(/\n/g, "");
+
+  // Use Notes' built-in predicate search — much faster than manual loops on large databases.
+  // Iterate matches to skip any that are in Recently Deleted.
+  const findResult = await runAppleScript(
+    `tell application "Notes"\n` +
+    `set matchingNotes to (every note whose name is "${st}")\n` +
+    `repeat with n in matchingNotes\n` +
+    `try\n` +
+    `if name of folder of n is not "Recently Deleted" then\n` +
+    `set body of n to "${sc}"\n` +
+    `return "updated"\n` +
+    `end if\n` +
+    `end try\n` +
+    `end repeat\n` +
+    `return "not-found"\n` +
+    `end tell`
+  );
+
+  if (findResult === "updated") return "updated";
+
+  // Note does not exist — find the target folder and create it.
+  return await runAppleScript(
+    `tell application "Notes"\n` +
+    `set targetFolder to missing value\n` +
+    `repeat with theAccount in accounts\n` +
+    `repeat with theFolder in folders of theAccount\n` +
+    `if name of theFolder is "${sf}" then\n` +
+    `set targetFolder to theFolder\n` +
+    `exit repeat\n` +
+    `end if\n` +
+    `repeat with subFolder in folders of theFolder\n` +
+    `if name of subFolder is "${sf}" then\n` +
+    `set targetFolder to subFolder\n` +
+    `exit repeat\n` +
+    `end if\n` +
+    `end repeat\n` +
+    `if targetFolder is not missing value then exit repeat\n` +
+    `end repeat\n` +
+    `if targetFolder is not missing value then exit repeat\n` +
+    `end repeat\n` +
+    `if targetFolder is not missing value then\n` +
+    `tell targetFolder\n` +
+    `make new note with properties {name:"${st}", body:"${sc}"}\n` +
+    `end tell\n` +
+    `return "created-in-folder"\n` +
+    `else\n` +
+    `make new note with properties {name:"${st}", body:"${sc}"}\n` +
+    `return "created-default"\n` +
+    `end if\n` +
+    `end tell`
+  );
+}
+
+function readRequestBody(req: IncomingMessage): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    req.on("data", (chunk: Buffer) => chunks.push(chunk));
+    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+    req.on("error", reject);
+  });
+}
+
+const httpServer = createServer(async (req: IncomingMessage, res: ServerResponse) => {
+  const url = new URL(req.url ?? "/", `http://127.0.0.1:${HTTP_PORT}`);
+
+  if (req.method === "GET" && url.pathname === "/health") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ status: "ok" }));
+    return;
+  }
+
+  if (req.method === "POST" && url.pathname === "/update-note") {
+    try {
+      const body = await readRequestBody(req);
+      const { folder, title, content } = JSON.parse(body) as { folder: string; title: string; content: string };
+      if (!folder || !title || !content) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "folder, title, and content are required" }));
+        return;
+      }
+      const result = await updateNote(folder, title, content);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ result }));
+    } catch (err: any) {
+      log("ERROR", `HTTP /update-note: ${err.message}`);
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: err.message }));
+    }
+    return;
+  }
+
+  res.writeHead(404, { "Content-Type": "application/json" });
+  res.end(JSON.stringify({ error: "not found" }));
+});
+
+httpServer.listen(HTTP_PORT, "127.0.0.1", () => {
+  log("INFO", `HTTP proxy listening on http://127.0.0.1:${HTTP_PORT}`);
+});
 
 // =============================================================================
 // Start server and run startup indexing (Changes C and M)
