@@ -569,7 +569,7 @@ export const searchAndCombineResults = async (
 async function updateNote(folder: string, title: string, content: string): Promise<string> {
   const sf = escapeForAppleScript(folder);
   const st = escapeForAppleScript(title);
-  const sc = escapeForAppleScript(content).replace(/\n/g, "");
+  const sc = escapeForAppleScript(content).replace(/\n/g, "\\n");
 
   // Use Notes' built-in predicate search — much faster than manual loops on large databases.
   // Iterate matches to skip any that are in Recently Deleted.
@@ -623,10 +623,21 @@ async function updateNote(folder: string, title: string, content: string): Promi
   );
 }
 
+const MAX_REQUEST_BODY = 1_048_576; // 1 MB
+
 function readRequestBody(req: IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
-    req.on("data", (chunk: Buffer) => chunks.push(chunk));
+    let totalSize = 0;
+    req.on("data", (chunk: Buffer) => {
+      totalSize += chunk.length;
+      if (totalSize > MAX_REQUEST_BODY) {
+        reject(new Error("request body too large"));
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
     req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
     req.on("error", reject);
   });
@@ -656,7 +667,7 @@ const httpServer = createServer(async (req: IncomingMessage, res: ServerResponse
     } catch (err: any) {
       log("ERROR", `HTTP /update-note: ${err.message}`);
       res.writeHead(500, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: err.message }));
+      res.end(JSON.stringify({ error: "internal error" }));
     }
     return;
   }
