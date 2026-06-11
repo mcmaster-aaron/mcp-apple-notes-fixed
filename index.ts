@@ -571,18 +571,30 @@ async function updateNote(folder: string, title: string, content: string): Promi
   const st = escapeForAppleScript(title);
   const sc = escapeForAppleScript(content).replace(/\n/g, "\\n");
 
-  // Use Notes' built-in predicate search — much faster than manual loops on large databases.
-  // Iterate matches to skip any that are in Recently Deleted.
+  // Use nested-loop search — iterates folders/subfolders, skips Recently Deleted.
   const findResult = await runAppleScript(
     `tell application "Notes"\n` +
-    `set matchingNotes to (every note whose name is "${st}")\n` +
-    `repeat with n in matchingNotes\n` +
-    `try\n` +
-    `if name of folder of n is not "Recently Deleted" then\n` +
-    `set body of n to "${sc}"\n` +
+    `repeat with theAccount in accounts\n` +
+    `repeat with theFolder in folders of theAccount\n` +
+    `if name of theFolder is not "Recently Deleted" then\n` +
+    `repeat with theNote in notes of theFolder\n` +
+    `if name of theNote is "${st}" then\n` +
+    `set body of theNote to "${sc}"\n` +
     `return "updated"\n` +
     `end if\n` +
-    `end try\n` +
+    `end repeat\n` +
+    `repeat with subFolder in folders of theFolder\n` +
+    `if name of subFolder is not "Recently Deleted" then\n` +
+    `repeat with theNote in notes of subFolder\n` +
+    `if name of theNote is "${st}" then\n` +
+    `set body of theNote to "${sc}"\n` +
+    `return "updated"\n` +
+    `end if\n` +
+    `end repeat\n` +
+    `end if\n` +
+    `end repeat\n` +
+    `end if\n` +
+    `end repeat\n` +
     `end repeat\n` +
     `return "not-found"\n` +
     `end tell`
@@ -649,6 +661,50 @@ const httpServer = createServer(async (req: IncomingMessage, res: ServerResponse
   if (req.method === "GET" && url.pathname === "/health") {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ status: "ok" }));
+    return;
+  }
+
+  if (req.method === "GET" && url.pathname === "/read-note") {
+    const title = url.searchParams.get("title");
+    if (!title) {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "title query parameter is required" }));
+      return;
+    }
+    try {
+      const st = escapeForAppleScript(title);
+      const body = await runAppleScript(
+        `tell application "Notes"\n` +
+        `repeat with theAccount in accounts\n` +
+        `repeat with theFolder in folders of theAccount\n` +
+        `if name of theFolder is not "Recently Deleted" then\n` +
+        `repeat with theNote in notes of theFolder\n` +
+        `if name of theNote is "${st}" then\n` +
+        `return body of theNote\n` +
+        `end if\n` +
+        `end repeat\n` +
+        `repeat with subFolder in folders of theFolder\n` +
+        `if name of subFolder is not "Recently Deleted" then\n` +
+        `repeat with theNote in notes of subFolder\n` +
+        `if name of theNote is "${st}" then\n` +
+        `return body of theNote\n` +
+        `end if\n` +
+        `end repeat\n` +
+        `end if\n` +
+        `end repeat\n` +
+        `end if\n` +
+        `end repeat\n` +
+        `end repeat\n` +
+        `return ""\n` +
+        `end tell`
+      );
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ body }));
+    } catch (err: any) {
+      log("ERROR", `HTTP /read-note: ${err.message}`);
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "internal error" }));
+    }
     return;
   }
 
